@@ -36,6 +36,7 @@ Spigot) to send/receive events.
 from __future__ import annotations
 
 import abc
+import argparse
 import json
 import time
 from dataclasses import dataclass, field
@@ -158,6 +159,45 @@ Respond with a JSON list where each element has fields: "verb", "target", and op
             # If parsing fails, fall back to no action
             return []
 
+
+class SimpleHeuristicPlanner(Planner):
+    """Deterministic planner useful for local testing without an LLM."""
+
+    def __init__(self, desired_wood: int = 3, exploration_step: Tuple[float, float, float] = (1.0, 0.0, 1.0)) -> None:
+        self.desired_wood = desired_wood
+        self.exploration_step = exploration_step
+
+    def plan(self, observation: Observation, memory: Memory) -> List[Action]:
+        plan: List[Action] = []
+
+        wood_count = observation.inventory.get("wood", 0)
+        if wood_count < self.desired_wood:
+            plan.append(Action(verb="mine", target="wood", args={"reason": "gather_resources"}))
+        else:
+            # Look up the last move target to avoid oscillating.
+            last_move_target: Optional[Tuple[float, float, float]] = None
+            for entry in reversed(memory.recall_recent(5)):
+                if entry.action_taken.verb == "move" and isinstance(entry.action_taken.target, (list, tuple)):
+                    last_move_target = tuple(entry.action_taken.target)
+                    break
+
+            next_target = tuple(
+                observation.position[i] + self.exploration_step[i]
+                for i in range(3)
+            )
+            if last_move_target == next_target:
+                # Take a different direction if we already moved there recently
+                next_target = (
+                    observation.position[0] + self.exploration_step[2],
+                    observation.position[1],
+                    observation.position[2] + self.exploration_step[0],
+                )
+
+            plan.append(Action(verb="move", target=list(next_target), args={"style": "explore"}))
+            plan.append(Action(verb="say", target="Exploring the surroundings!", args={"channel": "npc"}))
+
+        return plan
+
 # -----------------------------------------------------------------------------
 # Minecraft Agent
 # -----------------------------------------------------------------------------
@@ -240,7 +280,8 @@ class StubMinecraftPlugin(MinecraftAgent):
     def _execute_action(self, action: Action) -> str:
         # In reality, convert the Action into game commands.  Here we just
         # update local state and print to console for demonstration.
-        result_summary = f"Executed {action.verb} with target={action.target} and args={action.args}"
+        args_display = action.args if action.args is not None else {}
+        result_summary = f"Executed {action.verb} with target={action.target} and args={args_display}"
         # Example: update inventory if action is 'mine'
         if action.verb == "mine" and action.target == "wood":
             self.inventory["wood"] += 1
@@ -259,28 +300,49 @@ class StubMinecraftPlugin(MinecraftAgent):
 # Usage Example (Pseudo‑Code)
 # -----------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    # Example: Using OpenAI’s API as the LLM client.  Replace with actual API call.
-    class DummyLLMClient:
-        def complete(self, prompt: str) -> str:
-            # For demonstration, always return a simple plan
-            return json.dumps([
-                {"verb": "mine", "target": "wood", "args": {}},
-                {"verb": "move", "target": [1.0, 64.0, 1.0], "args": {}},
-                {"verb": "say", "target": "Hello there!", "args": {}}
-            ])
+def _build_planner(name: str) -> Planner:
+    """Factory helper for the CLI demo."""
 
-    # System prompt should define NPC personality and goals
-    system_prompt = (
-        "You are an autonomous Minecraft NPC. Your goal is to survive, gather resources, "
-        "build shelters, and help nearby players. You must follow Minecraft’s rules and "
-        "never cheat. Provide detailed plans using high‑level actions like 'move', 'mine', "
-        "'craft', and 'say'."
-    )
-    planner = LLMPlanner(DummyLLMClient(), system_prompt, agent_framework="LangGraph")
+    if name == "simple":
+        return SimpleHeuristicPlanner()
 
-    # Instantiate the stub plugin
-    agent = StubMinecraftPlugin(planner)
-    # Run a few ticks
-    for _ in range(2):
+    if name == "dummy-llm":
+        class DummyLLMClient:
+            def complete(self, prompt: str) -> str:
+                # For demonstration, always return a simple plan
+                return json.dumps([
+                    {"verb": "mine", "target": "wood", "args": {}},
+                    {"verb": "move", "target": [1.0, 64.0, 1.0], "args": {}},
+                    {"verb": "say", "target": "Hello there!", "args": {}}
+                ])
+
+        system_prompt = (
+            "You are an autonomous Minecraft NPC. Your goal is to survive, gather resources, "
+            "build shelters, and help nearby players. You must follow Minecraft’s rules and "
+            "never cheat. Provide detailed plans using high-level actions like 'move', 'mine', "
+            "'craft', and 'say'."
+        )
+        return LLMPlanner(DummyLLMClient(), system_prompt, agent_framework="LangGraph")
+
+    raise ValueError(f"Unknown planner '{name}'. Choose from 'simple' or 'dummy-llm'.")
+
+
+def _run_demo(planner_name: str, ticks: int, interval: float) -> None:
+    agent = StubMinecraftPlugin(_build_planner(planner_name))
+    for _ in range(ticks):
         agent.tick()
+        if interval:
+            time.sleep(interval)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the Minecraft agent stub loop.")
+    parser.add_argument("--planner", choices=["simple", "dummy-llm"], default="simple",
+                        help="Planner implementation to use for the demo run.")
+    parser.add_argument("--ticks", type=int, default=2,
+                        help="Number of agent ticks to execute before exiting.")
+    parser.add_argument("--interval", type=float, default=0.0,
+                        help="Optional sleep duration (seconds) between ticks.")
+    args = parser.parse_args()
+
+    _run_demo(args.planner, max(1, args.ticks), max(0.0, args.interval))
